@@ -1,34 +1,6 @@
 'use strict';
-const { v4: uuidv4 } = require('uuid');
 
-// Pool de IDs anônimos — rotaciona para evitar rate limit
-const ID_POOL_SIZE = 10;
-let idPool = buildPool();
-let poolIndex = 0;
-
-function buildPool() {
-  return Array.from({ length: ID_POOL_SIZE }, () => ({
-    anonId: 'anon_' + uuidv4().replace(/-/g, '').substring(0, 14),
-    deviceId: uuidv4(),
-  }));
-}
-
-function nextId() {
-  const id = idPool[poolIndex % idPool.length];
-  poolIndex++;
-  return id;
-}
-
-function rotateId(index) {
-  idPool[index % idPool.length] = {
-    anonId: 'anon_' + uuidv4().replace(/-/g, '').substring(0, 14),
-    deviceId: uuidv4(),
-  };
-}
-
-function makeCookie(anonId, deviceId) {
-  return `abIDV2=383; premium=false; anonID=${anonId}; qbDeviceId=${deviceId}`;
-}
+const POLLINATIONS_URL = 'https://text.pollinations.ai/';
 
 function cleanResponse(text) {
   if (!text) return '';
@@ -40,108 +12,61 @@ function cleanResponse(text) {
     .trim();
 }
 
-function isRateLimitError(status, body) {
-  const s = String(body || '');
-  return status === 429 || status === 403 ||
-    s.includes('sign up') || s.includes('login') || s.includes('rate limit');
-}
-
-// Parseia texto NDJSON e extrai o conteúdo
-function parseNDJSON(text) {
-  let result = '';
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const json = JSON.parse(line);
-      if (json.type === 'content' && json.content) result += json.content;
-    } catch (_) {}
-  }
-  return cleanResponse(result);
-}
-
-async function attemptRequest(message, { anonId, deviceId }) {
-  const conversationId = uuidv4();
-  const cookie = makeCookie(anonId, deviceId);
-
+async function attemptRequest(message) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 55000);
 
   let res;
   try {
-    res = await fetch(
-      `https://quillbot.com/api/ai-chat/chat/conversation/${conversationId}`,
-      {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Origin': 'https://quillbot.com',
-          'Referer': `https://quillbot.com/ai-chat/c/${conversationId}`,
-          'Accept': 'application/x-ndjson',
-          'Content-Type': 'application/json',
-          'platform-type': 'webapp',
-          'qb-product': 'AI-CHAT',
-          'webapp-version': '42.32.1',
-          'Cookie': cookie,
-          'anonid': anonId,
-        },
-        body: JSON.stringify({
-          message: {
-            content: message,
-            prompt: { id: 'ai-chat/omnibox', version: 1 },
-          },
-          context: {
-            editorContext: '',
-            selectionContext: '',
-            userDialect: 'en-us',
-            apiVersion: 2,
-          },
-          origin: { name: 'ai-chat.chat', url: 'https://quillbot.com' },
-        }),
-      }
-    );
+    res = await fetch(POLLINATIONS_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+        'Origin': 'https://pollinations.ai',
+        'Referer': 'https://pollinations.ai/',
+      },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: message }],
+        model: 'openai',
+        seed: Math.floor(Math.random() * 9999),
+        private: true,
+      }),
+    });
   } finally {
     clearTimeout(timeout);
   }
 
-  const body = await res.text();
-
-  if (isRateLimitError(res.status, body)) {
-    const err = new Error('rate_limit');
-    err.isRateLimit = true;
+  if (!res.ok) {
+    const err = new Error(`pollinations HTTP ${res.status}`);
+    err.isRateLimit = res.status === 429 || res.status === 503;
     throw err;
   }
 
-  if (!res.ok) throw new Error(`quillbot HTTP ${res.status}`);
-
-  const text = parseNDJSON(body);
-  if (!text) throw new Error('empty_response');
-  return text;
+  const text = await res.text();
+  const clean = cleanResponse(text);
+  if (!clean) throw new Error('empty_response');
+  return clean;
 }
 
 async function sendMessage(message, { signal } = {}) {
-  const MAX_ATTEMPTS = 4;
+  const MAX_ATTEMPTS = 3;
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const idIndex = (poolIndex + attempt) % idPool.length;
-    const id = idPool[idIndex];
-
     try {
-      return await attemptRequest(message, id);
+      return await attemptRequest(message);
     } catch (err) {
       if (signal?.aborted) throw err;
-
-      if (err.isRateLimit) {
-        rotateId(idIndex);
-        if (attempt < MAX_ATTEMPTS - 1) await sleep(300 * attempt);
+      if (err.isRateLimit && attempt < MAX_ATTEMPTS - 1) {
+        await sleep(500 * (attempt + 1));
         continue;
       }
-
       throw err;
     }
   }
 
-  throw new Error('rate_limit_exceeded — todos os IDs esgotados');
+  throw new Error('todas as tentativas falharam');
 }
 
 function sleep(ms) {
