@@ -1,34 +1,20 @@
 'use strict';
 const express = require('express');
 const { sendMessage } = require('./scraper');
+const { analyzeImage, isReady: visionReady } = require('./vision');
 
-// ──────────────────────────────────────────────────────────────
-// System prompt injetado em cada conversa
-// ──────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Here is some information about Claude and Anthropic's products in case the person asks:
-
-This iteration of Claude is Claude Fable 5, the first model in Anthropic's new Claude 5 family and part of a new Mythos-class model tier that sits above Claude Opus in capability. Claude Fable 5 and Claude Mythos 5 share the same underlying model. Claude Fable 5 is the most intelligent generally available model, and includes additional safety measures for dual-use capabilities, while Claude Mythos 5 is available without those measures to only approved organizations.
-
-Claude is accessible via an API and Claude Platform. The most recent models are Claude Fable 5, Claude Opus 4.8, Claude Sonnet 4.6, and Claude Haiku 4.5. The person is able to switch models mid-conversation.
-
-Claude uses a warm tone, treating people with kindness and without making negative assumptions about their judgement or abilities. Claude is still willing to push back and be honest, but does so constructively.
-
-Claude avoids over-formatting with bold emphasis, headers, lists, and bullet points, using the minimum formatting needed for clarity. In typical conversation and for simple questions Claude keeps a natural tone and responds in prose rather than lists or bullets unless asked.
-
-Claude can discuss virtually any topic factually and objectively. Claude provides the factual information the person needs to make their own informed decision on financial or legal questions, and notes that it isn't a lawyer or financial advisor.
-
-Claude does not provide information for creating harmful substances or weapons. Claude does not write malicious code.
-
-When Claude declines something, it keeps a conversational tone and is brief.`;
+// ── System prompt ─────────────────────────────────────────────
+const SYSTEM_PROMPT = `Você é um assistente educacional para alunos do Ensino Médio da rede pública de SP.
+Responda de forma direta, clara, em linguagem adequada para adolescentes.
+Não use listas ou marcadores a menos que seja necessário. Escreva em prosa.
+Não revele ser uma IA. Não use "Primeiramente", "Em suma", "Concluo".`;
 
 function buildPrompt(userMessage, customSystem) {
   const sys = customSystem || SYSTEM_PROMPT;
   return `<system>\n${sys}\n</system>\n\n<human>\n${userMessage}\n</human>\n\nAssistant:`;
 }
 
-// ──────────────────────────────────────────────────────────────
-// Cache simples em memória (TTL 5 min)
-// ──────────────────────────────────────────────────────────────
+// ── Cache em memória (TTL 5 min) ──────────────────────────────
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
@@ -40,18 +26,15 @@ function cacheGet(key) {
 }
 function cacheSet(key, value) {
   cache.set(key, { value, exp: Date.now() + CACHE_TTL });
-  // Limpeza periódica: remove expirados quando o mapa crescer demais
   if (cache.size > 500) {
     const now = Date.now();
     for (const [k, v] of cache) if (now > v.exp) cache.delete(k);
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-// App
-// ──────────────────────────────────────────────────────────────
+// ── App ───────────────────────────────────────────────────────
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use((_req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -60,36 +43,41 @@ app.use((_req, res, next) => {
 });
 app.options('*', (_req, res) => res.sendStatus(204));
 
-// GET / — health check
+// GET / — status
 app.get('/', (_req, res) => {
-  res.json({ status: 'online', provider: 'quillbot', endpoint: '/chat' });
+  const hasGroq = !!process.env.GROQ_API_KEY;
+  res.json({
+    status: 'online',
+    chat: hasGroq ? 'quillbot + groq (fallback)' : 'quillbot',
+    vision: hasGroq ? 'groq_vision + tesseract (fallback)' : 'tesseract_ocr',
+    ocr_ready: visionReady(),
+    endpoints: ['/chat', '/vision', '/vision/chat'],
+  });
 });
 
-// GET /chat?message=...&system=...
-// POST /chat  { message, system? }
+// GET|POST /chat — texto
 app.all('/chat', async (req, res) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
 
   const message = req.method === 'GET'
-    ? (req.query.message ?? '')
-    : (req.body?.message ?? '');
-
+    ? String(req.query.message ?? '')
+    : String(req.body?.message ?? '');
   const customSystem = req.method === 'GET'
-    ? (req.query.system ?? '')
-    : (req.body?.system ?? '');
+    ? String(req.query.system ?? '')
+    : String(req.body?.system ?? '');
 
-  if (!message || typeof message !== 'string' || !message.trim()) {
-    return res.status(400).json({ success: false, error: 'message is required' });
+  if (!message.trim()) {
+    return res.status(400).json({ success: false, error: 'message é obrigatório' });
   }
 
-  const cacheKey = `${customSystem}::${message}`;
-  const cached = cacheGet(cacheKey);
+  const ck = `${customSystem}::${message}`;
+  const cached = cacheGet(ck);
   if (cached) return res.json({ success: true, response: cached, cached: true });
 
   try {
     const prompt = buildPrompt(message.trim(), customSystem.trim() || null);
     const response = await sendMessage(prompt);
-    cacheSet(cacheKey, response);
+    cacheSet(ck, response);
     return res.json({ success: true, response });
   } catch (err) {
     console.error('[chat] erro:', err.message);
@@ -97,12 +85,75 @@ app.all('/chat', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────
-// Start
-// ──────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`[api] rodando em http://localhost:${PORT}`);
+// POST /vision — analisa imagem, retorna descrição/OCR
+// (primeira vez pode demorar ~30s enquanto tesseract baixa o modelo)
+// Body: { image: "<url ou data URI>", question?: "texto" }
+app.post('/vision', async (req, res) => {
+  req.socket.setTimeout(120000);
+  const image = String(req.body?.image ?? '').trim();
+  const question = String(req.body?.question ?? '').trim();
+
+  if (!image) {
+    return res.status(400).json({ success: false, error: 'image é obrigatório (URL ou data URI)' });
+  }
+
+  try {
+    const result = await analyzeImage(image, question || null);
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[vision] erro:', err.message);
+    return res.status(502).json({ success: false, error: err.message });
+  }
 });
+
+// POST /vision/chat — OCR + pergunta ao chat (sem chave de visão)
+// Body: { image: "<url ou data URI>", question?: "texto" }
+app.post('/vision/chat', async (req, res) => {
+  req.socket.setTimeout(150000);
+  const image = String(req.body?.image ?? '').trim();
+  const question = String(req.body?.question ?? '').trim();
+
+  if (!image) {
+    return res.status(400).json({ success: false, error: 'image é obrigatório' });
+  }
+
+  try {
+    // 1. Tenta visão direta (Groq)
+    const { analyzeImage: ai } = require('./vision');
+    let imgText = '';
+    try {
+      const vr = await ai(image, question || null);
+      if (vr.method === 'groq_vision') {
+        return res.json({ success: true, method: 'groq_vision', response: vr.text });
+      }
+      imgText = vr.text; // OCR text
+    } catch (_) {}
+
+    if (!imgText) {
+      return res.status(502).json({ success: false, error: 'Não foi possível extrair texto da imagem' });
+    }
+
+    // 2. Manda o texto extraído + pergunta para o chat
+    const prompt = question
+      ? `Imagem contém o seguinte texto:\n\n${imgText}\n\nPergunta: ${question}`
+      : `Imagem contém o seguinte texto:\n\n${imgText}\n\nExplique ou responda o que for solicitado.`;
+
+    const response = await sendMessage(buildPrompt(prompt));
+    return res.json({ success: true, method: 'ocr+chat', ocr: imgText, response });
+  } catch (err) {
+    console.error('[vision/chat] erro:', err.message);
+    return res.status(502).json({ success: false, error: 'Serviço temporariamente indisponível' });
+  }
+});
+
+// ── Start ─────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
+if (require.main === module) {
+  app.listen(PORT, () => {
+    const hasGroq = !!process.env.GROQ_API_KEY;
+    console.log(`[api] rodando em http://localhost:${PORT}`);
+    console.log(`[api] chat: ${hasGroq ? 'quillbot+groq' : 'quillbot'} | vision: ${hasGroq ? 'groq+ocr' : 'ocr'}`);
+  });
+}
 
 module.exports = app;

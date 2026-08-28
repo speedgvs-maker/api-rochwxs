@@ -13,6 +13,8 @@
   },
   "dependencies": {
     "express": "^4.21.0",
+    "impit": "^0.14.4",
+    "tesseract.js": "^7.0.0",
     "uuid": "^10.0.0"
   }
 }
